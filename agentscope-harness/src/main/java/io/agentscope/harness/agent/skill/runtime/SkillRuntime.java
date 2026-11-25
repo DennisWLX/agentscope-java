@@ -15,13 +15,30 @@
  */
 package io.agentscope.harness.agent.skill.runtime;
 
+import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.skill.SkillFilter;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.Toolkit;
+import io.agentscope.harness.agent.context.ContextItem;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 
 /**
  * Aggregates the singleton {@link SkillLoadTool} and the {@link SkillPromptBuilder}. {@link
@@ -42,6 +59,130 @@ public final class SkillRuntime {
             new AtomicReference<>(SkillCatalog.empty());
     private final SkillLoadTool loadTool;
     private final SkillPromptBuilder promptBuilder;
+
+    /** Binds recovery to one subscribed Harness execution, including error and cancellation. */
+    public static <T> Flux<T> withRecoveryScope(
+            Agent agent, RuntimeContext context, Supplier<Flux<T>> execution) {
+        if (agent == null || context == null) return Flux.defer(execution);
+        return Flux.using(
+                () -> {
+                    LoadedMaterials materials = new LoadedMaterials(agent);
+                    context.put(LoadedMaterials.class, materials);
+                    return materials;
+                },
+                materials -> execution.get(),
+                LoadedMaterials::close);
+    }
+
+    static void recordLoad(
+            Agent agent,
+            RuntimeContext context,
+            String callId,
+            String skillId,
+            String path,
+            ToolResultBlock result) {
+        LoadedMaterials materials = recoveryScope(agent, context);
+        if (materials == null || callId == null) return;
+        String text = receiptText(result);
+        if (text == null) return;
+        materials.stage(
+                callId,
+                ContextItem.runtimeState(
+                        "loaded_skill",
+                        "harness:loaded_skill:" + skillId + "/" + path,
+                        true,
+                        text));
+    }
+
+    /** Confirms that a native load actually reached the request before Harness reduced it. */
+    public static List<ContextItem> loadedMaterials(
+            Agent agent, RuntimeContext context, List<Msg> request, List<Msg> history) {
+        LoadedMaterials materials = recoveryScope(agent, context);
+        return materials == null ? List.of() : materials.confirm(request, history);
+    }
+
+    /** Returns loaded documents without a complete receipt in the final request. */
+    public static List<ContextItem> missingMaterials(List<ContextItem> loaded, List<Msg> messages) {
+        if (loaded.isEmpty()) return List.of();
+        Set<String> visible = new HashSet<>(receipts(messages).values());
+        return loaded.stream().filter(item -> !visible.contains(item.content())).toList();
+    }
+
+    private static LoadedMaterials recoveryScope(Agent agent, RuntimeContext context) {
+        LoadedMaterials scope = context == null ? null : context.get(LoadedMaterials.class);
+        return agent != null && scope != null && scope.owner == agent ? scope : null;
+    }
+
+    private static Map<String, String> receipts(List<Msg> messages) {
+        Map<String, String> receipts = new LinkedHashMap<>();
+        for (Msg message : messages) {
+            if (message.getRole() != MsgRole.TOOL) continue;
+            for (ToolResultBlock result : message.getContentBlocks(ToolResultBlock.class)) {
+                if (!SkillLoadTool.TOOL_NAME.equals(result.getName())) continue;
+                String text = receiptText(result);
+                if (text != null) receipts.put(result.getId(), text);
+            }
+        }
+        return receipts;
+    }
+
+    private static String receiptText(ToolResultBlock result) {
+        return (result.getState() == ToolResultState.SUCCESS
+                                || result.getState() == ToolResultState.RUNNING)
+                        && result.getOutput().size() == 1
+                        && result.getOutput().get(0) instanceof TextBlock text
+                ? text.getText()
+                : null;
+    }
+
+    private static final class LoadedMaterials {
+        private record Revision(ContextItem item, Map<String, Boolean> eligibleByCallId) {}
+
+        private volatile Agent owner;
+        private final Map<String, Revision> latestBySource = new LinkedHashMap<>();
+
+        private LoadedMaterials(Agent owner) {
+            this.owner = owner;
+        }
+
+        private synchronized void stage(String callId, ContextItem item) {
+            if (owner == null) return;
+            Revision latest = latestBySource.get(item.sourceId());
+            if (latest == null || !latest.item().revision().equals(item.revision())) {
+                latest = new Revision(item, new HashMap<>());
+                latestBySource.put(item.sourceId(), latest);
+            }
+            latest.eligibleByCallId().put(callId, false);
+        }
+
+        private synchronized List<ContextItem> confirm(List<Msg> request, List<Msg> history) {
+            if (latestBySource.isEmpty()) return List.of();
+            Map<String, String> visible = receipts(request);
+            Map<String, String> inHistory = receipts(history);
+            List<ContextItem> eligible = new ArrayList<>();
+            for (Revision latest : latestBySource.values()) {
+                Map<String, Boolean> calls = latest.eligibleByCallId();
+                for (Map.Entry<String, Boolean> call : calls.entrySet()) {
+                    String id = call.getKey();
+                    String text = visible.get(id);
+                    if (latest.item().content().equals(text)) {
+                        call.setValue(true);
+                    } else if (!Objects.equals(inHistory.get(id), text)) {
+                        // Request-only filtering suspends this receipt until its full text returns.
+                        call.setValue(false);
+                    }
+                }
+                if (calls.containsValue(true)) eligible.add(latest.item());
+            }
+            return List.copyOf(eligible);
+        }
+
+        private synchronized void close() {
+            // A caller or tool may retain a copy of the context beyond this execution.
+            owner = null;
+            latestBySource.clear();
+        }
+    }
 
     public SkillRuntime() {
         this(new SkillPromptBuilder());

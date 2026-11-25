@@ -179,7 +179,19 @@ public final class SkillLoadTool implements AgentTool {
                 return Mono.just(ToolResultBlock.error(skillNotFound(skillId)));
             }
 
-            return Mono.just(loadOne(entry, path));
+            ToolResultBlock result = loadOne(entry, path);
+            if (param.getToolUseBlock() != null
+                    && (SKILL_FILE.equals(path)
+                            || (path.startsWith("references/") && path.endsWith(".md")))) {
+                SkillRuntime.recordLoad(
+                        param.getAgent(),
+                        param.getRuntimeContext(),
+                        param.getToolUseBlock().getId(),
+                        entry.skill().getSkillId(),
+                        path,
+                        result);
+            }
+            return Mono.just(result);
         } catch (Exception e) {
             log.error("load_skill_through_path failed", e);
             return Mono.just(ToolResultBlock.error(e.getMessage()));

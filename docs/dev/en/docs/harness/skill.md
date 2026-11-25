@@ -297,6 +297,8 @@ To activate a skill the agent calls a built-in tool — `load_skill_through_path
 - `load_skill_through_path(skillId, path="SKILL.md")` returns the markdown body
 - `load_skill_through_path(skillId, path="references/style-guide.md")` returns any other file under the skill directory
 
+Harness [restores loaded Markdown instructions within the same call](/dev/en/docs/harness/context) if their complete tool results are removed from the reasoning request. This applies to `SKILL.md` and Markdown files loaded from `references/`, not arbitrary skill files.
+
 How the file gets fetched depends on where the skill came from:
 
 | Skill source | How `path` is resolved |

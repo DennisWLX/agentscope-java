@@ -297,6 +297,8 @@ Harness 把本轮可见的技能渲染成 `<available_skills>` 块，放在临�
 - `load_skill_through_path(skillId, path="SKILL.md")` 返回 markdown 正文
 - `load_skill_through_path(skillId, path="references/style-guide.md")` 返回该 skill 目录下的任意文件
 
+如果推理请求中不再包含完整工具回执，Harness 会在[同一次调用内恢复已加载的 Markdown 规程](/dev/zh/docs/harness/context)。恢复范围为 `SKILL.md` 和 `references/` 下实际加载的 Markdown 文件，不包含任意技能资源。
+
 具体怎么取文件，取决于 skill 来自哪里：
 
 | Skill 来源 | path 解析方式 |

@@ -18,6 +18,8 @@ package io.agentscope.harness.agent.middleware;
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.CapabilitySurface;
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.SkillFilter;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
@@ -48,8 +50,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -226,7 +230,16 @@ public class HarnessSkillMiddleware implements HarnessRuntimeMiddleware {
     /** Narrow declaration: subclasses overriding more hooks must extend this set. */
     @Override
     public Set<ExtensionPoint> activePoints() {
-        return EnumSet.of(ExtensionPoint.ON_SYSTEM_PROMPT);
+        return EnumSet.of(ExtensionPoint.ON_AGENT, ExtensionPoint.ON_SYSTEM_PROMPT);
+    }
+
+    @Override
+    public Flux<AgentEvent> onAgent(
+            Agent agent,
+            RuntimeContext ctx,
+            AgentInput input,
+            Function<AgentInput, Flux<AgentEvent>> next) {
+        return SkillRuntime.withRecoveryScope(agent, ctx, () -> next.apply(input));
     }
 
     /** Visible for tests / introspection. */

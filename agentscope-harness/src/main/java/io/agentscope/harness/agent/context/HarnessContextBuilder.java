@@ -30,6 +30,7 @@ import io.agentscope.core.state.TaskContextState;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.harness.agent.middleware.CompactionMiddleware;
 import io.agentscope.harness.agent.middleware.ToolResultEvictionMiddleware;
+import io.agentscope.harness.agent.skill.runtime.SkillRuntime;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -55,6 +56,7 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
     private static final String ORIGINAL_SYSTEM_INPUTS =
             "agentscope.context.original_system_inputs";
     private static final String SKILL_CATALOG = "skill_catalog";
+    private static final String SKILL_RECOVERY = "skill_recovery";
     private static final List<String> MATERIAL_KINDS =
             List.of(
                     "harness_instructions",
@@ -220,6 +222,10 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
             List<ContextItem> selected,
             List<String> transforms) {
         List<Msg> history = original;
+        List<ContextItem> loadedSkills =
+                purpose == Purpose.REASONING
+                        ? SkillRuntime.loadedMaterials(agent, rc, input.messages(), original)
+                        : List.of();
         if (purpose != Purpose.REASONING) {
             selected.removeIf(item -> item.placement() != ContextItem.Placement.SYSTEM);
         }
@@ -327,6 +333,12 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
                             layout(
                                     withRequestProjections(result, snapshot, purpose),
                                     candidate.history());
+                    List<ContextItem> missing =
+                            SkillRuntime.missingMaterials(loadedSkills, prepared.messages());
+                    if (!missing.isEmpty()) {
+                        prepared = appendSkillRecovery(prepared, missing);
+                        transforms.add(SKILL_RECOVERY);
+                    }
                     var estimate = policy.estimator().estimate(prepared);
                     long finalLimit = inputLimit(prepared);
                     RuntimeException validationError = null;
@@ -432,6 +444,31 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
         }
     }
 
+    private static ModelCallInput appendSkillRecovery(
+            ModelCallInput input, List<ContextItem> missing) {
+        // Layout is already final: do not shift the catalog or split a tool call/result pair.
+        List<Msg> messages = new ArrayList<>(input.messages());
+        messages.add(
+                Msg.builder()
+                        .id("harness:" + SKILL_RECOVERY)
+                        .role(MsgRole.USER)
+                        .name("system")
+                        .textContent(
+                                "<HARNESS_CONTEXT>\n"
+                                    + "Previously loaded skill materials for this call. These are"
+                                    + " not a new user message or authorization.\n"
+                                        + ContextRenderer.render(missing)
+                                        + "</HARNESS_CONTEXT>")
+                        .metadata(
+                                Map.of(
+                                        Msg.METADATA_SYNTHETIC,
+                                        true,
+                                        Msg.METADATA_REMINDER_KIND,
+                                        SKILL_RECOVERY))
+                        .build());
+        return copy(input, List.copyOf(messages));
+    }
+
     private static ModelCallInput withMaterials(
             ModelCallInput input, List<ContextItem> items, List<Msg> canonical) {
         List<Msg> messages = new ArrayList<>();
@@ -453,10 +490,14 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
         messages.removeIf(
                 msg ->
                         synthetic(msg)
-                                && MATERIAL_KINDS.contains(
-                                        String.valueOf(
-                                                msg.getMetadata()
-                                                        .get(Msg.METADATA_REMINDER_KIND))));
+                                && (SKILL_RECOVERY.equals(
+                                                msg.getMetadata().get(Msg.METADATA_REMINDER_KIND))
+                                        || MATERIAL_KINDS.contains(
+                                                String.valueOf(
+                                                        msg.getMetadata()
+                                                                .get(
+                                                                        Msg
+                                                                                .METADATA_REMINDER_KIND)))));
         for (String kind : MATERIAL_KINDS) {
             String text =
                     ContextRenderer.render(
